@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: riskqueue
+      POSTGRES_USER: riskqueue
+      POSTGRES_PASSWORD: riskqueue
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U riskqueue"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - riskqueue-postgres:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://riskqueue:riskqueue@postgres:5432/riskqueue
+    depends_on:
+      postgres:
+        condition: service_healthy
+  dashboard:
+    build: .
+    command: ["streamlit", "run", "dashboard/app.py", "--server.address=0.0.0.0"]
+    ports: ["8501:8501"]
+volumes:
+  riskqueue-postgres:
+

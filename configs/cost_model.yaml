@@ -1,0 +1,6 @@
+# Illustrative assumptions, not estimates from a financial institution.
+manual_review_cost: 4.0
+fraud_loss_fraction: 1.0
+review_capacity_per_day: 750
+minimum_fraud_recall: 0.70
+
