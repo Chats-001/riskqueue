@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SUMMARY_PATH = ROOT / "artifacts/figures/summary.json"
 CAPACITY_PATH = ROOT / "artifacts/figures/capacity_results.csv"
 THRESHOLD_PATH = ROOT / "artifacts/figures/threshold_policies.csv"
+SCORED_PATH = ROOT / "artifacts/figures/scored_test.csv"
+QUEUE_PATH = ROOT / "artifacts/figures/review_queue.csv"
+ERROR_PATH = ROOT / "artifacts/figures/error_analysis.csv"
 
 st.set_page_config(page_title="RiskQueue", page_icon="▦", layout="wide")
 st.markdown(
@@ -33,6 +36,9 @@ if not SUMMARY_PATH.exists():
 summary = json.loads(SUMMARY_PATH.read_text())
 capacity = pd.read_csv(CAPACITY_PATH)
 thresholds = pd.read_csv(THRESHOLD_PATH)
+scored = pd.read_csv(SCORED_PATH)
+queue = pd.read_csv(QUEUE_PATH)
+errors = pd.read_csv(ERROR_PATH)
 best = summary["metrics"][summary["best_model"]]
 
 page = st.sidebar.radio(
@@ -72,7 +78,27 @@ if page == "Executive overview":
         },
     )
     fig.update_yaxes(tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+    left, right = st.columns([1.15, 0.85])
+    with left:
+        st.subheader("Risk-score distribution")
+        st.image(str(ROOT / "artifacts/figures/score_distribution.png"))
+    with right:
+        st.subheader("Highest-exposure transaction types")
+        exposure = (
+            scored.groupby("type", as_index=False)
+            .expected_loss.sum()
+            .sort_values("expected_loss", ascending=False)
+        )
+        type_chart = px.bar(
+            exposure,
+            x="expected_loss",
+            y="type",
+            orientation="h",
+            labels={"expected_loss": "Expected exposure ($)", "type": "Transaction type"},
+        )
+        type_chart.update_layout(showlegend=False, yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(type_chart, width="stretch")
     st.markdown(
         '<div class="note"><b>What this means.</b> Probability finds likely fraud; expected-loss ranking also considers the dollars exposed. The useful policy depends on whether operations value case capture, dollar capture, or net review value.</div>',
         unsafe_allow_html=True,
@@ -82,11 +108,28 @@ elif page == "Model performance":
     st.subheader("Held-out model comparison")
     st.dataframe(
         rows.style.format({c: "{:.3f}" for c in rows.columns if c != "model"}),
-        use_container_width=True,
+        width="stretch",
     )
     st.image(
         str(ROOT / "artifacts/figures/precision_recall.png"),
         caption="Precision–recall is the primary rare-event metric.",
+    )
+    st.image(
+        str(ROOT / "artifacts/figures/model_diagnostics.png"),
+        caption="ROC, probability calibration, and one operating-point confusion matrix.",
+    )
+    st.subheader("Segment error analysis")
+    dimension = st.segmented_control(
+        "Break down by",
+        options=["type", "amount_bucket"],
+        default="type",
+        format_func=lambda value: value.replace("_", " ").title(),
+    )
+    shown_errors = errors[errors.dimension == dimension]
+    st.dataframe(
+        shown_errors.style.format({"recall": "{:.1%}", "fraud_value": "${:,.0f}"}),
+        hide_index=True,
+        width="stretch",
     )
 elif page == "Review queue":
     selected_capacity = st.slider(
@@ -118,9 +161,52 @@ elif page == "Review queue":
                 "fraud_amount_captured": "${:,.0f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
+    )
+    st.subheader("Ranked transaction queue")
+    display_count = st.slider("Rows to show", 10, 100, 25, 5)
+    selected_bands = st.multiselect(
+        "Risk bands",
+        options=["critical", "high", "guarded", "low"],
+        default=["critical", "high", "guarded", "low"],
+    )
+    shown_queue = queue[queue.risk_band.isin(selected_bands)].head(display_count)
+    st.dataframe(
+        shown_queue.style.format(
+            {
+                "amount": "${:,.2f}",
+                "fraud_probability": "{:.2%}",
+                "expected_loss": "${:,.2f}",
+            }
+        ).background_gradient(subset=["expected_loss"], cmap="YlOrRd"),
+        hide_index=True,
+        width="stretch",
     )
 elif page == "Decision policy":
+    col1, col2, col3, col4 = st.columns(4)
+    selected_threshold = col1.slider(
+        "Threshold", 0.0, 1.0, float(summary["selected_threshold"]), 0.01
+    )
+    review_cost = col2.number_input("Review cost ($)", 0.0, 100.0, 4.0, 0.5)
+    loss_fraction = col3.slider("Fraud loss fraction", 0.0, 1.0, 1.0, 0.05)
+    policy_capacity = col4.number_input(
+        "Review capacity", 1, len(scored), min(750, len(scored)), 25
+    )
+    decisions = scored.fraud_probability >= selected_threshold
+    positives = scored.isFraud == 1
+    policy_precision = float((positives & decisions).sum() / max(1, decisions.sum()))
+    policy_recall = float((positives & decisions).sum() / max(1, positives.sum()))
+    missed_loss = float(scored.loc[positives & ~decisions, "amount"].sum() * loss_fraction)
+    modeled_cost = float(decisions.sum() * review_cost + missed_loss)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Modeled cost", f"${modeled_cost:,.0f}")
+    k2.metric("Queue size", f"{int(decisions.sum()):,}", f"capacity {int(policy_capacity):,}")
+    k3.metric("Precision", f"{policy_precision:.1%}")
+    k4.metric("Recall", f"{policy_recall:.1%}")
+    if decisions.sum() > policy_capacity:
+        st.warning(
+            "The threshold creates more alerts than the selected capacity; a top-k queue is required."
+        )
     st.subheader("Threshold policy comparison")
     st.dataframe(
         thresholds.style.format(
@@ -132,7 +218,7 @@ elif page == "Decision policy":
                 "modeled_cost": "${:,.0f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
     )
     st.image(str(ROOT / "artifacts/figures/threshold_cost.png"))
 elif page == "Explainability":
@@ -149,7 +235,7 @@ elif page == "Explainability":
         ],
         columns=["Feature", "Definition"],
     )
-    st.dataframe(definitions, hide_index=True, use_container_width=True)
+    st.dataframe(definitions, hide_index=True, width="stretch")
 elif page == "Monitoring":
     st.subheader("Offline drift monitor")
     st.metric(

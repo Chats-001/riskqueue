@@ -9,7 +9,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_recall_curve
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import confusion_matrix, precision_recall_curve, roc_curve
 
 from riskqueue.decisions.economics import realized_decision_cost
 from riskqueue.decisions.review_queue import build_review_queue, queue_metrics
@@ -64,6 +65,66 @@ def generate_report_artifacts(
 
     best_name = max(metrics, key=lambda name: metrics[name]["average_precision"])
     best_probs = model_probabilities[best_name]
+
+    # Diagnostics used by the model-performance dashboard.
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))
+    false_positive_rate, true_positive_rate, _ = roc_curve(labels, best_probs)
+    axes[0].plot(false_positive_rate, true_positive_rate, color=COLORS["blue"], lw=2.5)
+    axes[0].plot([0, 1], [0, 1], ls="--", color="#97A6B2")
+    axes[0].set(
+        title=f"ROC curve · AUC {metrics[best_name]['roc_auc']:.3f}",
+        xlabel="False-positive rate",
+        ylabel="True-positive rate",
+    )
+    observed, predicted = calibration_curve(labels, best_probs, n_bins=8, strategy="quantile")
+    axes[1].plot(predicted, observed, marker="o", color=COLORS["amber"], lw=2.5)
+    axes[1].plot([0, 1], [0, 1], ls="--", color="#97A6B2")
+    axes[1].set(
+        title=f"Calibration · Brier {metrics[best_name]['brier']:.3f}",
+        xlabel="Mean predicted probability",
+        ylabel="Observed fraud rate",
+    )
+    matrix = confusion_matrix(labels, best_probs >= 0.15)
+    image = axes[2].imshow(matrix, cmap="Blues")
+    for (row, column), value in np.ndenumerate(matrix):
+        axes[2].text(column, row, f"{value:,}", ha="center", va="center", fontsize=13)
+    axes[2].set(
+        title="Confusion matrix · threshold 0.15",
+        xlabel="Predicted class",
+        ylabel="Actual class",
+        xticks=[0, 1],
+        yticks=[0, 1],
+    )
+    fig.colorbar(image, ax=axes[2], fraction=0.045)
+    for ax in axes:
+        ax.grid(alpha=0.15)
+    _finish(fig, output / "model_diagnostics.png")
+
+    fig, ax = plt.subplots(figsize=(8.4, 4.8))
+    ax.hist(
+        best_probs[labels == 0],
+        bins=30,
+        alpha=0.7,
+        density=True,
+        label="Not fraud",
+        color=COLORS["blue"],
+    )
+    ax.hist(
+        best_probs[labels == 1],
+        bins=30,
+        alpha=0.68,
+        density=True,
+        label="Fraud",
+        color=COLORS["red"],
+    )
+    ax.set(
+        title="Held-out risk-score distribution",
+        xlabel="Predicted fraud probability",
+        ylabel="Density",
+    )
+    ax.grid(alpha=0.15)
+    ax.legend(frameon=False)
+    _finish(fig, output / "score_distribution.png")
     capacities = sorted(set([25, 50, 100, 250, 500, min(750, len(test)), min(1000, len(test))]))
     capacity_rows = []
     fig, ax = plt.subplots(figsize=(8.4, 5.2))
@@ -182,6 +243,53 @@ def generate_report_artifacts(
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     pd.DataFrame(capacity_rows).to_csv(output / "capacity_results.csv", index=False)
     pd.DataFrame(threshold_table).to_csv(output / "threshold_policies.csv", index=False)
+
+    scored = test.copy()
+    scored["fraud_probability"] = best_probs
+    scored["expected_loss"] = best_probs * scored.amount
+    scored["risk_band"] = pd.cut(
+        best_probs,
+        bins=[-np.inf, 0.1, 0.4, 0.75, np.inf],
+        labels=["low", "guarded", "high", "critical"],
+    ).astype(str)
+    queue = build_review_queue(scored, best_probs, min(750, len(scored)), "expected_loss")
+    queue_columns = [
+        "transaction_id",
+        "step",
+        "type",
+        "amount",
+        "fraud_probability",
+        "expected_loss",
+        "risk_band",
+        "rank",
+        "isFraud",
+    ]
+    queue[queue_columns].to_csv(output / "review_queue.csv", index=False)
+    scored.to_csv(output / "scored_test.csv", index=False)
+
+    error_frame = scored.assign(
+        predicted=best_probs >= chosen,
+        amount_bucket=pd.qcut(scored.amount, 4, duplicates="drop").astype(str),
+        hour=scored.step % 24,
+    )
+    error_rows = []
+    for dimension in ("type", "amount_bucket"):
+        for segment, group in error_frame.groupby(dimension, observed=True):
+            positives = int(group.isFraud.sum())
+            true_positives = int(((group.isFraud == 1) & group.predicted).sum())
+            false_positives = int(((group.isFraud == 0) & group.predicted).sum())
+            error_rows.append(
+                {
+                    "dimension": dimension,
+                    "segment": str(segment),
+                    "transactions": len(group),
+                    "fraud_cases": positives,
+                    "recall": true_positives / positives if positives else 0.0,
+                    "false_positives": false_positives,
+                    "fraud_value": float(group.loc[group.isFraud == 1, "amount"].sum()),
+                }
+            )
+    pd.DataFrame(error_rows).to_csv(output / "error_analysis.csv", index=False)
 
     # A recruiter-facing overview assembled entirely from the generated test results.
     fig = plt.figure(figsize=(14, 8), facecolor="#F4F6F8")
